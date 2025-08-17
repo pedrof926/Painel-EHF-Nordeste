@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: ehf-ne
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -k gthread -w 2 -t 120 -b 0.0.0.0:$PORT app:server
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      # opcionais (se quiser sobrepor os padrões)
+      # - key: PREV_XLSX
+      #   value: "previsao_ne_5dias.xlsx"
+      # - key: ATTR_XLSX
+      #   value: "arquivo_ne_completo_preenchido.xlsx"
+      # - key: GEOJSON_PATH
+      #   value: "municipios_nordeste.geojson"
