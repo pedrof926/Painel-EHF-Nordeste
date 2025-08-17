@@ -1,4 +1,4 @@
-# painel_ehf_nordeste.py
+# app.py  (EHF – Nordeste, com GeoJSON de municípios)
 import os, json
 import pandas as pd
 import numpy as np
@@ -7,13 +7,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # --------- Config ---------
-# >>> ajustados para arquivos locais na mesma pasta do app
 ARQ_PREV = os.environ.get("PREV_XLSX", "previsao_ne_5dias.xlsx")
 ARQ_ATTR = os.environ.get("ATTR_XLSX", "arquivo_ne_completo_preenchido.xlsx")
-
-# >>> usar GeoJSON por padrão (na raiz do repo). Mantém fallback para SHP se quiser.
 GEOJSON_PATH = os.environ.get("GEOJSON_PATH", "municipios_nordeste.geojson")
-SHP_PATH     = os.environ.get("SHP_PATH", "")  # deixe vazio se não for usar SHP
+SHP_PATH     = os.environ.get("SHP_PATH", "")   # não usado no Render
 
 CLASS_ORDER = ["Normal","Baixa intensidade","Severa","Extrema"]
 COLOR_MAP = {
@@ -23,23 +20,22 @@ COLOR_MAP = {
     "Extrema": "#C0392B",
 }
 
-# Barras em três azuis (claro → médio → escuro)
 BAR_COLOR_MAP = {
     "Tmín":  "#BFDBFE",
     "Tméd":  "#60A5FA",
     "Tmáx":  "#1E3A8A",
 }
 
-# Risco combinado
 RISK_ORDER  = ["Baixo","Moderado","Alto","Muito alto"]
 RISK_COLORS = {"Baixo":"#65A30D","Moderado":"#FACC15","Alto":"#FB923C","Muito alto":"#DC2626"}
 
+NE_UFS = {"BA","SE","AL","PE","PB","RN","CE","PI","MA"}
+
 # --------- Helpers ---------
-def z7(s):
+def z7(s): 
     return pd.Series(s, dtype=str).str.extract(r"(\d+)")[0].str.zfill(7)
 
 def calc_ehf(df: pd.DataFrame) -> pd.DataFrame:
-    """Calcula T3 centrado (com bordas preenchidas), EHI_sig, EHI_accl e EHF."""
     df = df.sort_values(["CD_MUN","data"]).reset_index(drop=True)
 
     def _t3_centered_keep_index(s: pd.Series) -> pd.Series:
@@ -56,15 +52,12 @@ def calc_ehf(df: pd.DataFrame) -> pd.DataFrame:
     )
     df["T3d_prev"] = t3
 
-    # Nairn & Fawcett (2004)
     df["EHI_sig"]  = df["T3d_prev"] - df["Tmean_p95"]
     df["EHI_accl"] = df["T3d_prev"] - df["Tmean_30d"]
     df["EHF"]      = df["EHI_sig"].clip(lower=0) * df["EHI_accl"].apply(lambda x: x if pd.notna(x) and x > 1 else 1)
     return df
 
 def classify_by_tmean_percentis(df):
-    """Classificação por T3d_prev vs Tmean_p90/p95/p99, com gate EHF>0.
-       Fallback EHF/EHF99 se faltar p90/p99."""
     has_p90 = "Tmean_p90" in df.columns
     has_p99 = "Tmean_p99" in df.columns
     if has_p90 and has_p99:
@@ -102,34 +95,33 @@ def classify_by_tmean_percentis(df):
     return df
 
 def load_geojson():
-    """Carrega GeoJSON (prioritário). Se não houver, tenta converter SHP on-the-fly (opcional)."""
-    if GEOJSON_PATH and os.path.exists(GEOJSON_PATH):
-        with open(GEOJSON_PATH, "r", encoding="utf-8") as f:
+    """
+    Carrega GeoJSON (fallback: 'municipios_nordeste.geojson').
+    - Garante CD_MUN com 7 dígitos
+    - Recorta para UFs do Nordeste se SIGLA_UF existir
+    """
+    path = GEOJSON_PATH or "municipios_nordeste.geojson"
+    if path and os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
             gj = json.load(f)
-        for ft in gj.get("features", []):
-            props = ft.get("properties", {})
-            props["CD_MUN"] = str(props.get("CD_MUN","")).zfill(7)
-        return gj
 
-    if SHP_PATH and os.path.exists(SHP_PATH):
-        try:
-            import geopandas as gpd
-            gdf = gpd.read_file(SHP_PATH)
-            cd_col=None
-            for c in ["CD_MUN","CD_GEOCMU","CD_MUNIC","CD_GEOCODI","CD_IBGE","GEOCODIGO"]:
-                if c in gdf.columns: cd_col=c; break
-            if cd_col is None:
-                for c in gdf.columns:
-                    s=gdf[c].astype(str).str.replace(r"\D","", regex=True)
-                    if s.str.len().median() in [6,7]: cd_col=c; break
-            uf_col = next((c for c in ["SIGLA_UF","UF","ESTADO","SG_UF"] if c in gdf.columns), None)
-            gdf["CD_MUN"] = gdf[cd_col].astype(str).str.extract(r"(\d+)")[0].str.zfill(7) if cd_col else None
-            if uf_col and "SIGLA_UF" not in gdf.columns:
-                gdf["SIGLA_UF"] = gdf[uf_col]
-            gdf = gdf[["CD_MUN","SIGLA_UF","geometry"]]
-            return json.loads(gdf.to_json())
-        except Exception as e:
-            print("Aviso: falha ao converter SHP→GeoJSON:", e)
+        feats = gj.get("features", [])
+        # pad CD_MUN e recorte para NE
+        out = []
+        has_uf = False
+        for ft in feats:
+            props = ft.get("properties", {}) or {}
+            props["CD_MUN"] = str(props.get("CD_MUN","")).zfill(7)
+            ft["properties"] = props
+            if "SIGLA_UF" in props:
+                has_uf = True
+            out.append(ft)
+
+        if has_uf:
+            out = [ft for ft in out if ft["properties"].get("SIGLA_UF") in NE_UFS]
+
+        gj["features"] = out
+        return gj
     return None
 
 # --------- GeoSES do ATTR + risco combinado ---------
@@ -214,7 +206,7 @@ controls = html.Div([
 ], style={"display":"flex","gap":"12px","alignItems":"center","marginBottom":"10px","flexWrap":"wrap"})
 
 two_cols = html.Div([
-    html.Div([dcc.Graph(id="mapa", style={"height":"68vh"})], style={"flex":"1","paddingRight":"8px"}),
+    html.Div([dcc.Graph(id="mapa", style={"height":"62vh"})], style={"flex":"1","paddingRight":"8px"}),
     html.Div([
         dcc.Graph(id="barras", style={"height":"55vh","marginBottom":"8px"}),
         html.Div(id="cards-ehf", style={"display":"grid","gridTemplateColumns":"repeat(5, 1fr)","gap":"8px"})
@@ -297,7 +289,7 @@ def update_map(ufs_sel, munis_sel, date_idx, layer, sel_cd):
         cat_col, order, cmap, legend = "classification", CLASS_ORDER, COLOR_MAP, "Classificação"
 
     dff["cat"] = pd.Categorical(dff[cat_col], categories=order, ordered=True)
-    dff["cat_EHF"] = dff[cat_col].astype(str)  # para hover
+    dff["cat_EHF"] = dff[cat_col].astype(str)
 
     if gj is not None:
         fig = px.choropleth_mapbox(
@@ -306,11 +298,11 @@ def update_map(ufs_sel, munis_sel, date_idx, layer, sel_cd):
             hover_data={
                 "NM_MUN": True,
                 "SIGLA_UF": True,
-                "cat_EHF": True,   # só essas 3 infos
+                "cat_EHF": True,
                 "cat": False,
                 "CD_MUN": False
             },
-            center={"lat": -8.9, "lon": -38.5}, zoom=4.1, height=680
+            center={"lat": -8.9, "lon": -38.5}, zoom=4.2, height=620
         )
         fig.update_traces(marker_line_width=1.6, marker_line_color="#1f2937")
         fig.update_layout(mapbox_style="carto-positron", margin=dict(l=0,r=0,t=0,b=0),
@@ -323,17 +315,17 @@ def update_map(ufs_sel, munis_sel, date_idx, layer, sel_cd):
                 showscale=False, hoverinfo="skip"
             ))
     else:
+        # fallback (só se o GeoJSON não for encontrado)
         fig = px.scatter_mapbox(
             dff, lat="lat", lon="lon", color="cat", color_discrete_map=cmap,
             hover_name="NM_MUN",
             hover_data={"SIGLA_UF":True, "cat_EHF":True, "cat":False,
                         "lat":False, "lon":False},
-            zoom=3.8, height=680
+            zoom=3.8, height=620
         )
         fig.update_layout(mapbox_style="carto-positron", margin=dict(l=0, r=0, t=0, b=0))
     return fig
 
-# guarda o município clicado
 @app.callback(
     Output("muni-sel","data"),
     Input("mapa","clickData"),
@@ -347,7 +339,6 @@ def keep_selection(clickData, sel):
         if cd.strip("0"): return cd
     return sel
 
-# barras (5 dias) + cards (5 dias)
 @app.callback(
     Output("barras","figure"),
     Output("cards-ehf","children"),
@@ -414,7 +405,6 @@ def update_side(sel_cd, ufs_sel, munis_sel, date_idx):
         )
     return fig_bar, cards
 
-# lista por classificação
 @app.callback(
     Output("class-count","children"),
     Output("class-list","children"),
@@ -445,5 +435,6 @@ def list_by_class(sel_class, ufs_sel, munis_sel, date_idx):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8050)), debug=False)
+
 
 
