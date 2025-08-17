@@ -1,17 +1,26 @@
-# app.py  (EHF – Nordeste, com GeoJSON de municípios)
-import os, json
+# app.py — Painel EHF Nordeste (polígonos, GeoJSON local, robusto p/ Render)
+
+import os, json, re
+from pathlib import Path
 import pandas as pd
 import numpy as np
 from dash import Dash, dcc, html, Input, Output, State
 import plotly.express as px
 import plotly.graph_objects as go
+from flask import jsonify
 
-# --------- Config ---------
-ARQ_PREV = os.environ.get("PREV_XLSX", "previsao_ne_5dias.xlsx")
-ARQ_ATTR = os.environ.get("ATTR_XLSX", "arquivo_ne_completo_preenchido.xlsx")
-GEOJSON_PATH = os.environ.get("GEOJSON_PATH", "municipios_nordeste.geojson")
-SHP_PATH     = os.environ.get("SHP_PATH", "")   # não usado no Render
+# ---------------- Config & paths ----------------
+# Você pode sobrepor via variáveis de ambiente no Render:
+# PREV_XLSX, ATTR_XLSX, GEOJSON_PATH
+DEFAULT_PREV = "previsao_ne_5dias.xlsx"
+DEFAULT_ATTR = "arquivo_ne_completo_preenchido.xlsx"
+DEFAULT_GJ   = "municipios_nordeste.geojson"
 
+ARQ_PREV = os.environ.get("PREV_XLSX", DEFAULT_PREV)
+ARQ_ATTR = os.environ.get("ATTR_XLSX", DEFAULT_ATTR)
+GEOJSON_PATH = os.environ.get("GEOJSON_PATH", DEFAULT_GJ)
+
+# classes/cores
 CLASS_ORDER = ["Normal","Baixa intensidade","Severa","Extrema"]
 COLOR_MAP = {
     "Normal": "#2E7D32",
@@ -19,23 +28,22 @@ COLOR_MAP = {
     "Severa": "#E67E22",
     "Extrema": "#C0392B",
 }
-
 BAR_COLOR_MAP = {
     "Tmín":  "#BFDBFE",
     "Tméd":  "#60A5FA",
     "Tmáx":  "#1E3A8A",
 }
-
 RISK_ORDER  = ["Baixo","Moderado","Alto","Muito alto"]
 RISK_COLORS = {"Baixo":"#65A30D","Moderado":"#FACC15","Alto":"#FB923C","Muito alto":"#DC2626"}
 
 NE_UFS = {"BA","SE","AL","PE","PB","RN","CE","PI","MA"}
 
-# --------- Helpers ---------
-def z7(s): 
+# ---------------- Helpers ----------------
+def z7(s):
     return pd.Series(s, dtype=str).str.extract(r"(\d+)")[0].str.zfill(7)
 
 def calc_ehf(df: pd.DataFrame) -> pd.DataFrame:
+    """T3 centrado (bordas preenchidas) + EHF."""
     df = df.sort_values(["CD_MUN","data"]).reset_index(drop=True)
 
     def _t3_centered_keep_index(s: pd.Series) -> pd.Series:
@@ -51,13 +59,13 @@ def calc_ehf(df: pd.DataFrame) -> pd.DataFrame:
           .reset_index(level=0, drop=True)
     )
     df["T3d_prev"] = t3
-
     df["EHI_sig"]  = df["T3d_prev"] - df["Tmean_p95"]
     df["EHI_accl"] = df["T3d_prev"] - df["Tmean_30d"]
     df["EHF"]      = df["EHI_sig"].clip(lower=0) * df["EHI_accl"].apply(lambda x: x if pd.notna(x) and x > 1 else 1)
     return df
 
 def classify_by_tmean_percentis(df):
+    """Classifica com gate EHF>0."""
     has_p90 = "Tmean_p90" in df.columns
     has_p99 = "Tmean_p99" in df.columns
     if has_p90 and has_p99:
@@ -94,37 +102,64 @@ def classify_by_tmean_percentis(df):
         df["ratio"] = np.nan
     return df
 
+def _norm_cd_mun(x: str) -> str:
+    x = re.sub(r"\D", "", str(x or ""))
+    return x.zfill(7) if x else ""
+
 def load_geojson():
     """
-    Carrega GeoJSON (fallback: 'municipios_nordeste.geojson').
-    - Garante CD_MUN com 7 dígitos
-    - Recorta para UFs do Nordeste se SIGLA_UF existir
+    Carrega GeoJSON (tentando vários caminhos), normaliza CD_MUN/SIGLA_UF
+    e recorta para estados do NE (se SIGLA_UF existir).
     """
-    path = GEOJSON_PATH or "municipios_nordeste.geojson"
-    if path and os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            gj = json.load(f)
+    here = Path(__file__).resolve().parent
+    candidates = [
+        GEOJSON_PATH,
+        str(here / DEFAULT_GJ),
+        str(here / "data" / DEFAULT_GJ),
+        "/opt/render/project/src/" + DEFAULT_GJ,  # Render
+    ]
+    tried = []
+    for p in candidates:
+        if not p:
+            continue
+        tried.append(p)
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                gj = json.load(f)
 
-        feats = gj.get("features", [])
-        # pad CD_MUN e recorte para NE
-        out = []
-        has_uf = False
-        for ft in feats:
-            props = ft.get("properties", {}) or {}
-            props["CD_MUN"] = str(props.get("CD_MUN","")).zfill(7)
-            ft["properties"] = props
-            if "SIGLA_UF" in props:
-                has_uf = True
-            out.append(ft)
+            feats = gj.get("features", [])
+            out = []
+            has_uf = False
+            for ft in feats:
+                props = ft.get("properties", {}) or {}
 
-        if has_uf:
-            out = [ft for ft in out if ft["properties"].get("SIGLA_UF") in NE_UFS]
+                if "SIGLA_UF" not in props:
+                    for ufk in ("UF","SG_UF","estado","Estado","state"):
+                        if ufk in props:
+                            props["SIGLA_UF"] = str(props[ufk])
+                            break
 
-        gj["features"] = out
-        return gj
+                if "CD_MUN" not in props or not props["CD_MUN"]:
+                    for k in ("CD_GEOCMU","CD_GEOCODI","CD_MUNIC","CD_IBGE","GEOCODIGO","codigo_ibge","id"):
+                        if k in props and props[k]:
+                            props["CD_MUN"] = props[k]
+                            break
+                props["CD_MUN"] = _norm_cd_mun(props.get("CD_MUN"))
+                ft["properties"] = props
+                if props.get("SIGLA_UF"):
+                    has_uf = True
+                out.append(ft)
+
+            if has_uf:
+                out = [ft for ft in out if ft["properties"].get("SIGLA_UF") in NE_UFS]
+
+            gj["features"] = out
+            print(f"[geojson] OK: {p} — {len(out)} features")
+            return gj
+
+    print(f"[geojson] NÃO ENCONTRADO. Tentativas: {tried}")
     return None
 
-# --------- GeoSES do ATTR + risco combinado ---------
 def geoses_from_attr(attr_df: pd.DataFrame):
     if "GeoSES" not in attr_df.columns:
         return None
@@ -149,11 +184,22 @@ def add_combined_risk(df, geoses):
     has_risk = d["V"].notna().any()
     return d, has_risk
 
-# --------- Carrega dados ---------
+# ---------------- Load data ----------------
+def _resolve_local_path(p):
+    here = Path(__file__).resolve().parent
+    if os.path.exists(p): return p
+    cand = str(here / p)
+    return cand if os.path.exists(cand) else p
+
+ARQ_PREV = _resolve_local_path(ARQ_PREV)
+ARQ_ATTR = _resolve_local_path(ARQ_ATTR)
+
 prev = pd.read_excel(ARQ_PREV, engine="openpyxl")
 attr = pd.read_excel(ARQ_ATTR, engine="openpyxl")
-prev["CD_MUN"]=z7(prev["CD_MUN"]); attr["CD_MUN"]=z7(attr["CD_MUN"])
-prev["data"]=pd.to_datetime(prev["data"], errors="coerce")
+
+prev["CD_MUN"] = z7(prev["CD_MUN"])
+attr["CD_MUN"] = z7(attr["CD_MUN"])
+prev["data"]   = pd.to_datetime(prev["data"], errors="coerce")
 
 keep_attr = [
     "CD_MUN","NM_MUN","SIGLA_UF","lat","lon","NM_REGIAO","GeoSES",
@@ -170,12 +216,19 @@ base, HAS_RISK = add_combined_risk(base, geoses)
 
 ufs   = sorted(base["SIGLA_UF"].dropna().unique().tolist())
 dates = sorted(base["data"].dropna().dt.date.unique().tolist())
-gj = load_geojson()
+gj    = load_geojson()
 
-# --------- App ---------
+# ---------------- App ----------------
 app = Dash(__name__)
 server = app.server
 app.title = "Fator de Excesso de Calor (EHF) – Nordeste"
+
+# Endpoint de debug do GeoJSON
+@app.server.route("/_debug_gj")
+def _debug_gj():
+    n = len(gj.get("features", [])) if gj else 0
+    keys = list((gj.get("features", [{}])[0]).get("properties", {}).keys()) if n else []
+    return jsonify(loaded=bool(gj), features=n, sample_keys=keys)
 
 layer_options = [{"label":"Classificação EHF","value":"ehf"}]
 if HAS_RISK:
@@ -206,14 +259,13 @@ controls = html.Div([
 ], style={"display":"flex","gap":"12px","alignItems":"center","marginBottom":"10px","flexWrap":"wrap"})
 
 two_cols = html.Div([
-    html.Div([dcc.Graph(id="mapa", style={"height":"62vh"})], style={"flex":"1","paddingRight":"8px"}),
+    html.Div([dcc.Graph(id="mapa", style={"height":"68vh"})], style={"flex":"1","paddingRight":"8px"}),
     html.Div([
         dcc.Graph(id="barras", style={"height":"55vh","marginBottom":"8px"}),
         html.Div(id="cards-ehf", style={"display":"grid","gridTemplateColumns":"repeat(5, 1fr)","gap":"8px"})
     ], style={"flex":"1","paddingLeft":"8px"})
 ], style={"display":"flex","gap":"8px"})
 
-# ---- Painel de consulta por classificação (EHF no dia) ----
 class_panel = html.Div([
     html.H4("Consulta por classificação (EHF no dia)"),
     html.Div([
@@ -241,7 +293,7 @@ app.layout = html.Div(style={"fontFamily":"Inter, system-ui, Arial","padding":"1
     controls, two_cols, class_panel, store_sel
 ])
 
-# --------- Callbacks ---------
+# ---------------- Callbacks ----------------
 @app.callback(
     Output("muni-filter", "options"),
     Output("muni-filter", "value"),
@@ -302,7 +354,7 @@ def update_map(ufs_sel, munis_sel, date_idx, layer, sel_cd):
                 "cat": False,
                 "CD_MUN": False
             },
-            center={"lat": -8.9, "lon": -38.5}, zoom=4.2, height=620
+            center={"lat": -8.9, "lon": -38.5}, zoom=4.1, height=680
         )
         fig.update_traces(marker_line_width=1.6, marker_line_color="#1f2937")
         fig.update_layout(mapbox_style="carto-positron", margin=dict(l=0,r=0,t=0,b=0),
@@ -315,13 +367,13 @@ def update_map(ufs_sel, munis_sel, date_idx, layer, sel_cd):
                 showscale=False, hoverinfo="skip"
             ))
     else:
-        # fallback (só se o GeoJSON não for encontrado)
+        # fallback (só se GeoJSON falhar)
         fig = px.scatter_mapbox(
             dff, lat="lat", lon="lon", color="cat", color_discrete_map=cmap,
             hover_name="NM_MUN",
             hover_data={"SIGLA_UF":True, "cat_EHF":True, "cat":False,
                         "lat":False, "lon":False},
-            zoom=3.8, height=620
+            zoom=3.8, height=680
         )
         fig.update_layout(mapbox_style="carto-positron", margin=dict(l=0, r=0, t=0, b=0))
     return fig
@@ -433,8 +485,10 @@ def list_by_class(sel_class, ufs_sel, munis_sel, date_idx):
     lines = "\n".join(f"- {row.NM_MUN} / {row.SIGLA_UF} — EHF {row.EHF:.2f}" for row in dff.itertuples())
     return header, dcc.Markdown(lines)
 
+# ---------------- Run ----------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8050)), debug=False)
+
 
 
 
